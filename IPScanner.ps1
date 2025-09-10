@@ -3,7 +3,7 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Advanced Subnet Scanner"
-$form.Size = New-Object System.Drawing.Size(800,700)
+$form.Size = New-Object System.Drawing.Size(700,700)
 $form.StartPosition = "CenterScreen"
 
 $label = New-Object System.Windows.Forms.Label
@@ -20,26 +20,24 @@ $form.Controls.Add($textbox)
 
 $button = New-Object System.Windows.Forms.Button
 $button.Text = "Start Scan"
-$button.Width = 90
 $button.Location = New-Object System.Drawing.Point(220,42)
 $form.Controls.Add($button)
 
 $cancelButton = New-Object System.Windows.Forms.Button
 $cancelButton.Text = "Cancel Scan"
-$cancelButton.Width = 90
 $cancelButton.Location = New-Object System.Drawing.Point(320,42)
 $form.Controls.Add($cancelButton)
 
 $progress = New-Object System.Windows.Forms.ProgressBar
 $progress.Location = New-Object System.Drawing.Point(10,80)
-$progress.Size = New-Object System.Drawing.Size(760,25)
+$progress.Size = New-Object System.Drawing.Size(660,25)
 $progress.Minimum = 0
 $progress.Maximum = 254
 $form.Controls.Add($progress)
 
 $listview = New-Object System.Windows.Forms.ListView
 $listview.Location = New-Object System.Drawing.Point(10,120)
-$listview.Size = New-Object System.Drawing.Size(760,420)
+$listview.Size = New-Object System.Drawing.Size(660,420)
 $listview.View = 'Details'
 $listview.FullRowSelect = $true
 $listview.GridLines = $true
@@ -66,112 +64,59 @@ $script:webTasks = @()
 function Test-Port {
     param($ip,$port)
     try {
-        # Faster/connect-only with a small read attempt to capture simple banners
-        $tcp = New-Object System.Net.Sockets.TcpClient
+        $tcp = New-Object Net.Sockets.TcpClient
         $iar = $tcp.BeginConnect($ip,$port,$null,$null)
-        $connected = $iar.AsyncWaitHandle.WaitOne(400)
-        if (-not $connected) {
-            try { $tcp.Close() } catch {}
-            return $false
+        $success = $iar.AsyncWaitHandle.WaitOne(350)
+        if ($success) {
+            $tcp.EndConnect($iar) | Out-Null
+            $tcp.Close()
+            return $true
         }
-        $tcp.EndConnect($iar) | Out-Null
-
-        # Short timeouts for banner read
-        try {
-            $sock = $tcp.Client
-            $sock.ReceiveTimeout = 600
-            $sock.SendTimeout = 600
-            $stream = $tcp.GetStream()
-            if ($stream.CanRead) {
-                $buffer = New-Object byte[] 1024
-                $read = 0
-                try { $read = $stream.Read($buffer, 0, $buffer.Length) } catch {}
-                if ($read -gt 0) {
-                    $banner = [System.Text.Encoding]::ASCII.GetString($buffer,0,$read).Trim()
-                    # normalize banner for later inspection (not stored here to keep signature)
-                    $banner = ($banner -replace "[\r\n]+"," ") -replace "\s{2,}"," "
-                    # small heuristic: if banner contains known protocol names, consider it useful (optional)
-                }
-            }
-        } catch {}
-        try { $tcp.Close() } catch {}
-        return $true
-    } catch {
+        $tcp.Close()
         return $false
-    }
+    } catch { return $false }
 }
 
 function Test-WebInterface {
     param($ip)
-    # Ports to probe (http & https variants)
-    $ports = @(80,8080,8000,8008,443,8443,8444,8888)
-    foreach ($p in $ports) {
-        $isTls = $p -in 443,8443,8444
+    $list = @(80,8080,8000,8008,443,8443,8444,8888)
+    foreach ($p in $list) {
+        $isTls = ($p -in 443,8443,8444)
         $proto = if ($isTls) { "https" } else { "http" }
         $url = "${proto}://${ip}:$p/"
-
-        # Accept any cert for discovery only
-        try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
-
+        try {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        } catch {}
         try {
             $req = [System.Net.HttpWebRequest]::Create($url)
-            $req.Timeout = 3000
-            $req.Method = "HEAD"
+            $req.Timeout = 2500
             $req.AllowAutoRedirect = $true
+            $req.Method = "HEAD"
             $req.UserAgent = "Mozilla/5.0 (compatible)"
-            $req.Proxy = $null
-
             $resp = $null
             try {
                 $resp = $req.GetResponse()
-            } catch [System.Net.WebException] {
-                # capture response even on 401/403/etc
-                $resp = $_.Exception.Response
+            } catch {
+                $req.Method = "GET"
+                $resp = $req.GetResponse()
             }
-
             if ($resp -ne $null) {
                 $status = 0
                 try { $status = [int]$resp.StatusCode } catch {}
-                $serverHeader = $null
-                try { $serverHeader = $resp.Headers["Server"] } catch {}
-                # close the response when possible
-                try { $resp.Close() } catch {}
-
-                # If reachable or requires auth/redirect, gather richer info
-                if (($status -ge 100 -and $status -lt 400) -or $status -in 401,403,302) {
-                    # Try to obtain TLS cert CN when applicable
-                    $certCN = $null
-                    if ($isTls) {
-                        try {
-                            $tcp = New-Object System.Net.Sockets.TcpClient
-                            $tcp.ReceiveTimeout = 1000; $tcp.SendTimeout = 1000
-                            $tcp.Connect($ip,$p)
-                            $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, ({ $true }))
-                            $ssl.AuthenticateAsClient($ip)
-                            $rawCert = $ssl.RemoteCertificate
-                            if ($rawCert) {
-                                $x = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $rawCert
-                                $certCN = $x.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-                            }
-                            $ssl.Close(); $tcp.Close()
-                        } catch {}
-                    }
-
-                    # Try to extract a descriptive title (may be slow; keep short timeout in Extract-HtmlTitle)
-                    $title = $null
-                    try { $title = Extract-HtmlTitle -ip $ip -port $p -isTls:$isTls } catch {}
-
-                    # Build a descriptive result, prefer title then server header then cert CN
-                    $desc = $title
-                    if (-not $desc) { $desc = $serverHeader }
-                    if (-not $desc) { $desc = $certCN }
-
-                    return @{ Proto = $proto.ToUpper(); Port = $p; Server = $serverHeader; Title = $title; CertCN = $certCN; Desc = $desc }
+                if ($status -ge 100 -and $status -lt 400) {
+                    $serverHeader = $null
+                    try { $serverHeader = $resp.Headers["Server"] } catch {}
+                    $resp.Close()
+                    return @{Proto = ($proto.ToUpper()); Port = $p; Server = $serverHeader}
+                } elseif ($status -eq 401 -or $status -eq 403 -or $status -eq 302) {
+                    $serverHeader = $null
+                    try { $serverHeader = $resp.Headers["Server"] } catch {}
+                    $resp.Close()
+                    return @{Proto = ($proto.ToUpper()); Port = $p; Server = $serverHeader}
                 }
+                $resp.Close()
             }
-        } catch {
-            # ignore and continue probing other ports
-        }
+        } catch {}
     }
     return $null
 }
@@ -180,68 +125,22 @@ function Extract-HtmlTitle {
     param($ip,$port,$isTls)
     $proto = if ($isTls) { "https" } else { "http" }
     $urlbase = "${proto}://${ip}:$port/"
-
     try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
-
     try {
-        $req = [System.Net.HttpWebRequest]::Create($urlbase)
-        $req.Method = "GET"
-        $req.Timeout = 4000
-        $req.AllowAutoRedirect = $true
-        $req.UserAgent = "Mozilla/5.0 (compatible)"
-        $req.Proxy = $null
-
-        $resp = $req.GetResponse()
-        $stream = $resp.GetResponseStream()
-        $encoding = [System.Text.Encoding]::UTF8
-        $sr = New-Object System.IO.StreamReader($stream, $encoding)
-        $html = $sr.ReadToEnd()
-        $sr.Close()
-        try { $resp.Close() } catch {}
-
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add("User-Agent","Mozilla/5.0 (compatible)")
+        $html = $wc.DownloadString($urlbase)
         if ($html) {
-            # 1) <title>
-            $m = [regex]::Match($html,"<title[^>]*>(.*?)</title>", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            $m = [regex]::Match($html,"<title[^>]*>(.*?)</title>", "IgnoreCase")
             if ($m.Success) {
                 $t = $m.Groups[1].Value.Trim()
-                if ($t) { return ([System.Net.WebUtility]::HtmlDecode($t)) }
-            }
-
-            # 2) OpenGraph title meta
-            $m = [regex]::Match($html,'<meta[^>]+property=["'']og:title["''][^>]*content=["''](.*?)["'']', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($m.Success) {
-                $t = $m.Groups[1].Value.Trim()
-                if ($t) { return ([System.Net.WebUtility]::HtmlDecode($t)) }
-            }
-
-            # 3) meta name="title" or meta name="description"
-            $m = [regex]::Match($html,'<meta[^>]+name=["'']title["''][^>]*content=["''](.*?)["'']', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($m.Success) { $t = $m.Groups[1].Value.Trim(); if ($t) { return ([System.Net.WebUtility]::HtmlDecode($t)) } }
-            $m = [regex]::Match($html,'<meta[^>]+name=["'']description["''][^>]*content=["''](.*?)["'']', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($m.Success) { $t = $m.Groups[1].Value.Trim(); if ($t) { return ([System.Net.WebUtility]::HtmlDecode($t)) } }
-
-            # 4) first H1 element
-            $m = [regex]::Match($html,"<h1[^>]*>(.*?)</h1>", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($m.Success) {
-                $t = $m.Groups[1].Value.Trim()
-                if ($t) { return ([System.Net.WebUtility]::HtmlDecode($t)) }
-            }
-
-            # 5) look for common device signatures (printer, router, camera) in HTML body / title / headers
-            $bodySnippet = ($html -replace '\s+', ' ' )
-            $sig = $null
-            if ($bodySnippet -match '(?i)(printer|hp|epson|canon|xerox|jetdirect|router|gateway|camera|dvr|tplink|netgear|asus)') {
-                $sig = $matches[0]
-                # return the matched signature to give a hint
-                return $sig
+                if (![string]::IsNullOrWhiteSpace($t)) { return $t }
             }
         }
-    } catch {
-        # ignore errors, return $null to indicate no title found
-    }
-
+    } catch {}
     return $null
 }
+
 
 function Queue-HostnameResolve {
     param(
@@ -254,74 +153,62 @@ function Queue-HostnameResolve {
 
     $null = $ps.AddScript({
         param($ipAddr)
-        $result = "N/A"
 
-        # --- 1) Standard DNS Reverse Lookup ---
         try {
-            $task = [System.Threading.Tasks.Task[string]]::Factory.StartNew({
-                try {
-                    $entry = [System.Net.Dns]::GetHostEntry($ipAddr)
-                    if ($entry -and $entry.HostName) { return $entry.HostName }
-                } catch {}
-                return $null
-            })
-            if ($task.Wait(2000) -and $task.Result) { return $task.Result }
+            # 1) Resolve-DnsName (if available)
+            try {
+                if (Get-Command -Name Resolve-DnsName -ErrorAction SilentlyContinue) {
+                    $r = Resolve-DnsName -Name $ipAddr -ErrorAction SilentlyContinue
+                    if ($r) {
+                        $nh = ($r | Where-Object { $_.NameHost } | Select-Object -First 1).NameHost
+                        if ($nh) { return $nh }
+                    }
+                }
+            } catch {}
+
+            # 2) Fallback to GetHostEntry
+            try {
+                $entry = [System.Net.Dns]::GetHostEntry($ipAddr)
+                if ($entry -and $entry.HostName) { return $entry.HostName }
+            } catch {}
+
+            # 3) NetBIOS via nbtstat
+            try {
+                $nbtRaw = nbtstat -A $ipAddr 2>$null
+                if ($nbtRaw) {
+                    $lines = $nbtRaw -split "`r?`n"
+                    foreach ($ln in $lines) {
+                        if ($ln -match '^\s*([^\s]+)\s+<00>\s+UNIQUE') { return $matches[1].Trim() }
+                    }
+                    foreach ($ln in $lines) {
+                        if ($ln -match '^\s*([^\s]+)\s+<') { return $matches[1].Trim() }
+                    }
+                }
+            } catch {}
+
+            # 4) MAC / Vendor lookup (best-effort)
+            try {
+                $mac = $null
+                try { $nb = Get-NetNeighbor -IPAddress $ipAddr -ErrorAction SilentlyContinue; if ($nb) { $mac = $nb.LinkLayerAddress } } catch {}
+                if (-not $mac) {
+                    try {
+                        $a = arp -a | Select-String $ipAddr
+                        if ($a) {
+                            $parts = ($a -replace '\s{2,}',' ' -split ' ')
+                            $mac = $parts[-1]
+                        }
+                    } catch {}
+                }
+                if ($mac) {
+                    try {
+                        $vendor = Invoke-RestMethod -Uri ("https://api.macvendors.com/" + ($mac -replace '[:\-]','')) -Method Get -TimeoutSec 2 -ErrorAction SilentlyContinue
+                        if ($vendor) { return $vendor }
+                    } catch {}
+                }
+            } catch {}
+
         } catch {}
-
-        # --- 2) DNS GetHostAddresses fallback ---
-        try {
-            $addresses = [System.Net.Dns]::GetHostAddresses($ipAddr)
-            foreach ($a in $addresses) {
-                try {
-                    $e = [System.Net.Dns]::GetHostEntry($a)
-                    if ($e -and $e.HostName) { return $e.HostName }
-                } catch {}
-            }
-        } catch {}
-
-        # --- 3) NetBIOS / Windows Name ---
-        try {
-            $nbt = nbtstat -A $ipAddr 2>$null | Select-String "Name"
-            if ($nbt) {
-                $candidate = ($nbt -split '\s+')[1]
-                if ($candidate -and $candidate -ne "Name") { return $candidate }
-            }
-        } catch {}
-
-        # --- 4) mDNS (Bonjour / _http._tcp.local) ---
-        try {
-            $mdns = New-Object System.Net.Sockets.UdpClient
-            $mdns.Client.ReceiveTimeout = 500
-            $mdns.EnableBroadcast = $true
-            $mdns.Connect("224.0.0.251", 5353)
-
-            # Simple query packet for mDNS _services._dns-sd._udp.local (generic discovery)
-            $query = [byte[]] @(0,0,0,0,0,1,0,0,0,0,0,0) # Minimal placeholder, real mDNS query is complex
-            $mdns.Send($query, $query.Length) | Out-Null
-            try { $resp = $mdns.Receive([ref]([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any,0))) } catch {}
-            if ($resp) {
-                $result = "mDNS Device"
-            }
-            $mdns.Close()
-        } catch {}
-
-        # --- 5) UPnP / SSDP Discovery ---
-        try {
-            $ssdp = New-Object System.Net.Sockets.UdpClient
-            $ssdp.Client.ReceiveTimeout = 500
-            $ssdp.EnableBroadcast = $true
-            $ssdp.Connect("239.255.255.250", 1900)
-            $msg = "M-SEARCH * HTTP/1.1`r`nHOST: 239.255.255.250:1900`r`nMAN: ""ssdp:discover""`r`nMX: 1`r`nST: ssdp:all`r`n`r`n"
-            $bytes = [System.Text.Encoding]::ASCII.GetBytes($msg)
-            $ssdp.Send($bytes, $bytes.Length) | Out-Null
-            try { $resp = $ssdp.Receive([ref]([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any,0))) } catch {}
-            if ($resp) {
-                $result = "UPnP Device"
-            }
-            $ssdp.Close()
-        } catch {}
-
-        return $result
+        return "N/A"
     }).AddArgument($ip)
 
     $handle = $ps.BeginInvoke()
@@ -330,99 +217,44 @@ function Queue-HostnameResolve {
     $script:resolveTasks += [pscustomobject]@{ PS = $ps; Handle = $handle; Item = $item; IP = $ip }
 }
 
-
 function Queue-WebCheck {
     param(
         [string]$ip,
         [System.Windows.Forms.ListViewItem]$item
     )
-
     $ps = [powershell]::Create()
     $ps.RunspacePool = $script:rsPool
     $null = $ps.AddScript({
         param($ipAddr)
-
         $probe = $null
         $ports = @(80,8080,8000,8008,443,8443,8444,8888)
-
         foreach ($p in $ports) {
             $isTls = $p -in 443,8443,8444
             $proto = if ($isTls) { "https" } else { "http" }
-            $url   = "${proto}://${ipAddr}:$p/"
-
+            $url = "${proto}://${ipAddr}:$p/"
             try {
                 [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
             } catch {}
-
             try {
-                $req = [System.Net.HttpWebRequest]::Create($url)
-                $req.UserAgent = "Mozilla/5.0 (compatible; WebScanner/1.0)"
-                $req.AllowAutoRedirect = $true
-                $req.Timeout = 5000
-                $req.Proxy = $null
-
-                $resp = $req.GetResponse()
-                $sr = New-Object IO.StreamReader($resp.GetResponseStream())
-                $html = $sr.ReadToEnd()
-                $sr.Close()
-
-                if ($resp -ne $null) {
-                    $probe = [ordered]@{
-                        Proto  = $proto.ToUpper()
-                        Port   = $p
-                        Server = $resp.Headers["Server"]
-                        PoweredBy = $resp.Headers["X-Powered-By"]
-                        WWWAuth   = $resp.Headers["WWW-Authenticate"]
-                        Cookies   = $resp.Headers["Set-Cookie"]
-                        Title  = $null
-                        Meta   = @{}
-                        CertCN = $null
-                        CertIssuer = $null
-                    }
-
-                    # Extract <title>
-                    $m = [regex]::Match($html,"<title[^>]*>(.*?)</title>","IgnoreCase")
+                $wc = New-Object System.Net.WebClient
+                $wc.Headers.Add("User-Agent","Mozilla/5.0 (compatible)")
+                $wc.Proxy = $null
+                $wc.Encoding = [System.Text.Encoding]::UTF8
+                $html = $null
+                try { $html = $wc.DownloadString($url) } catch {}
+                if ($html -ne $null) {
+                    $probe = @{Proto=$proto.ToUpper(); Port=$p; Server=$wc.ResponseHeaders["Server"]}
+                    $m = [regex]::Match($html,"<title[^>]*>(.*?)</title>", "IgnoreCase")
                     if ($m.Success) { $probe.Title = $m.Groups[1].Value.Trim() }
-
-                    # Extract <meta name="...">
-                    $metaRegex = '<meta\s+(?:name|http-equiv)="([^"]+)"\s+content="([^"]+)"'
-                    foreach ($match in [regex]::Matches($html, $metaRegex, "IgnoreCase")) {
-                        $probe.Meta[$match.Groups[1].Value] = $match.Groups[2].Value
-                    }
-
-                    # If HTTPS, pull certificate info
-                    if ($isTls) {
-                        try {
-                            $tcp = New-Object System.Net.Sockets.TcpClient($ipAddr,$p)
-                            $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(),$false,({$true}))
-                            $ssl.AuthenticateAsClient($ipAddr)
-                            $cert = $ssl.RemoteCertificate
-                            if ($cert) {
-                                $x509 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $cert
-                                $probe.CertCN     = $x509.GetNameInfo("SimpleName",$false)
-                                $probe.CertIssuer = $x509.Issuer
-                            }
-                            $ssl.Dispose()
-                            $tcp.Close()
-                        } catch {}
-                    }
-
                     break
                 }
             } catch {}
         }
-
         return $probe
     }).AddArgument($ip)
-
     $handle = $ps.BeginInvoke()
     if (-not $script:webTasks) { $script:webTasks = @() }
-    $script:webTasks += [pscustomobject]@{
-        PS = $ps
-        Handle = $handle
-        Item = $item
-        IP = $ip
-    }
+    $script:webTasks += [pscustomobject]@{ PS = $ps; Handle = $handle; Item = $item; IP = $ip }
 }
 
 
@@ -506,10 +338,16 @@ $button.Add_Click({
             }
         }
 
-        # Process hostname tasks
+                # Process hostname tasks
         foreach ($t in @($script:resolveTasks)) {
             if ($t.Handle.IsCompleted) {
-                try { $hostname = $t.PS.EndInvoke($t.Handle) } catch { $hostname = "N/A" }
+                try {
+                    $res = $t.PS.EndInvoke($t.Handle)
+                    $hostname = ($res | Select-Object -First 1)
+                    if ($null -ne $hostname) { $hostname = [string]$hostname } else { $hostname = "N/A" }
+                } catch {
+                    $hostname = "N/A"
+                }
                 try { $t.PS.Dispose() } catch {}
                 $t.Item.SubItems[3].Text = if (![string]::IsNullOrWhiteSpace($hostname)) { $hostname } else { "N/A" }
                 $script:resolveTasks = $script:resolveTasks | Where-Object { $_ -ne $t }
