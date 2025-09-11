@@ -3,7 +3,7 @@ Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Advanced Subnet Scanner"
-$form.Size = New-Object System.Drawing.Size(700,700)
+$form.Size = New-Object System.Drawing.Size(1100,625)
 $form.StartPosition = "CenterScreen"
 
 $label = New-Object System.Windows.Forms.Label
@@ -20,24 +20,26 @@ $form.Controls.Add($textbox)
 
 $button = New-Object System.Windows.Forms.Button
 $button.Text = "Start Scan"
+$button.width = 90
 $button.Location = New-Object System.Drawing.Point(220,42)
 $form.Controls.Add($button)
 
 $cancelButton = New-Object System.Windows.Forms.Button
 $cancelButton.Text = "Cancel Scan"
+$cancelButton.width = 90
 $cancelButton.Location = New-Object System.Drawing.Point(320,42)
 $form.Controls.Add($cancelButton)
 
 $progress = New-Object System.Windows.Forms.ProgressBar
 $progress.Location = New-Object System.Drawing.Point(10,80)
-$progress.Size = New-Object System.Drawing.Size(660,25)
+$progress.Size = New-Object System.Drawing.Size(1065,25)
 $progress.Minimum = 0
 $progress.Maximum = 254
 $form.Controls.Add($progress)
 
 $listview = New-Object System.Windows.Forms.ListView
 $listview.Location = New-Object System.Drawing.Point(10,120)
-$listview.Size = New-Object System.Drawing.Size(660,420)
+$listview.Size = New-Object System.Drawing.Size(1065,420)
 $listview.View = 'Details'
 $listview.FullRowSelect = $true
 $listview.GridLines = $true
@@ -45,8 +47,19 @@ $listview.Columns.Add("IP Address",120) | Out-Null
 $listview.Columns.Add("Status",80) | Out-Null
 $listview.Columns.Add("Method",120) | Out-Null
 $listview.Columns.Add("Hostname",160) | Out-Null
-$listview.Columns.Add("Web Interface",220) | Out-Null
+$listview.Columns.Add("MAC Address", 220) | Out-Null
+$listview.Columns.Add("Web Interface",280) | Out-Null
 $form.Controls.Add($listview)
+
+$listview.Add_Click({
+    param($sender, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        $hit = $listview.HitTest($e.Location)
+        if ($hit -and $hit.SubItem -ne $null) {
+            [System.Windows.Forms.Clipboard]::SetText($hit.SubItem.Text)
+        }
+    }
+})
 
 $saveButton = New-Object System.Windows.Forms.Button
 $saveButton.Text = "Save Results"
@@ -60,6 +73,7 @@ $script:cancel = $false
 $script:rsPool = $null
 $script:resolveTasks = @()
 $script:webTasks = @()
+$script:macTasks = @()
 
 function Test-Port {
     param($ip,$port)
@@ -77,48 +91,191 @@ function Test-Port {
     } catch { return $false }
 }
 
-function Test-WebInterface {
-    param($ip)
-    $list = @(80,8080,8000,8008,443,8443,8444,8888)
-    foreach ($p in $list) {
-        $isTls = ($p -in 443,8443,8444)
-        $proto = if ($isTls) { "https" } else { "http" }
-        $url = "${proto}://${ip}:$p/"
+function Format-Mac {
+    param([string]$hex)
+    $clean = ($hex -replace '[^0-9A-Fa-f]', '').ToUpper()
+    if ($clean.Length -lt 12) { return $null }
+    return ($clean.ToCharArray() |
+        ForEach-Object -Begin { $i = 0 } -Process {
+            $i++
+            $_ + (if ($i % 2 -eq 0 -and $i -lt $clean.Length) { ':' } else { '' })
+        }) -join ''
+}
+
+function Get-MacAddress {
+    param([string]$ip)
+
+    # Force ARP population by sending packets
+    try {
+        # two ICMP pings
+        Test-Connection -ComputerName $ip -Count 2 -Quiet -TimeoutSeconds 1 | Out-Null
+    } catch {}
+
+    # Extra kick: try a TCP connect to port 445 (common)
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($ip, 445, $null, $null)
+        $iar.AsyncWaitHandle.WaitOne(200)
+        $client.Close()
+    } catch {}
+
+    # 1) Use Get-NetNeighbor if available
+    if (Get-Command Get-NetNeighbor -ErrorAction SilentlyContinue) {
         try {
-            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-        } catch {}
-        try {
-            $req = [System.Net.HttpWebRequest]::Create($url)
-            $req.Timeout = 2500
-            $req.AllowAutoRedirect = $true
-            $req.Method = "HEAD"
-            $req.UserAgent = "Mozilla/5.0 (compatible)"
-            $resp = $null
-            try {
-                $resp = $req.GetResponse()
-            } catch {
-                $req.Method = "GET"
-                $resp = $req.GetResponse()
-            }
-            if ($resp -ne $null) {
-                $status = 0
-                try { $status = [int]$resp.StatusCode } catch {}
-                if ($status -ge 100 -and $status -lt 400) {
-                    $serverHeader = $null
-                    try { $serverHeader = $resp.Headers["Server"] } catch {}
-                    $resp.Close()
-                    return @{Proto = ($proto.ToUpper()); Port = $p; Server = $serverHeader}
-                } elseif ($status -eq 401 -or $status -eq 403 -or $status -eq 302) {
-                    $serverHeader = $null
-                    try { $serverHeader = $resp.Headers["Server"] } catch {}
-                    $resp.Close()
-                    return @{Proto = ($proto.ToUpper()); Port = $p; Server = $serverHeader}
-                }
-                $resp.Close()
+            $nbr = Get-NetNeighbor -IPAddress $ip -ErrorAction SilentlyContinue |
+                   Where-Object State -in 'Reachable','Stale'
+            if ($nbr) {
+                $fmt = Format-Mac $nbr.LinkLayerAddress
+                if ($fmt) { return $fmt }
             }
         } catch {}
     }
-    return $null
+
+    # 2) Fallback: arp -a
+    try {
+        $arpTable = arp -a
+        foreach ($line in $arpTable) {
+            if ($line -match "^\s*$ip\s+") {
+                $parts = $line -split '\s+'
+                foreach ($idx in 1..($parts.Length - 1)) {
+                    if ($parts[$idx] -match '([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}') {
+                        $fmt = Format-Mac $parts[$idx]
+                        if ($fmt) { return $fmt }
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    # 3) Fallback: netsh
+    try {
+        $nh = netsh interface ip show neighbors |
+              Where-Object { $_ -match "\s+$ip\s+" }
+        if ($nh) {
+            $p = ($nh -split '\s+')[2]
+            $fmt = Format-Mac $p
+            if ($fmt) { return $fmt }
+        }
+    } catch {}
+
+    return "fuck"
+}
+
+function Queue-MacResolve {
+    param(
+        [string]$ip,
+        [System.Windows.Forms.ListViewItem]$item
+    )
+
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $script:rsPool
+
+    $null = $ps.AddScript({
+        param($ipAddr)
+
+        function Format-MacLocal {
+            param([string]$hex)
+            $clean = ($hex -replace '[^0-9A-Fa-f]', '').ToUpper()
+            if ($clean.Length -lt 12) { return $null }
+            return ($clean.ToCharArray() |
+                ForEach-Object -Begin { $i = 0 } -Process {
+                    $i++
+                    $_ + (if ($i % 2 -eq 0 -and $i -lt $clean.Length) { ':' } else { '' })
+                }) -join ''
+        }
+
+        # Import SendARP into this runspace (safe if already loaded)
+        try {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class ArpUtil {
+    [DllImport("iphlpapi.dll", ExactSpelling=true)]
+    public static extern int SendARP(int destIp, int srcIp, byte[] macAddr, ref int phyAddrLen);
+}
+"@ -ErrorAction SilentlyContinue
+        } catch {}
+
+        function Get-MacBySendARP {
+            param($ip)
+            try {
+                $bytes = [System.Net.IPAddress]::Parse($ipAddr).GetAddressBytes()
+                $ipInt = [System.BitConverter]::ToInt32($bytes,0)
+                $macBuf = New-Object byte[] 6
+                $len = $macBuf.Length
+                $ret = [ArpUtil]::SendARP($ipInt, 0, $macBuf, [ref] $len)
+                if ($ret -eq 0 -and $len -gt 0) {
+                    $actual = $macBuf[0..($len-1)]
+                    $hex = ($actual | ForEach-Object { $_.ToString("X2") }) -join ''
+                    return Format-MacLocal $hex
+                }
+            } catch {}
+            return $null
+        }
+
+        # Simple reliable resolver: try SendARP first, then nudge ARP and parse arp -a, retry a few times.
+        $attempts = 6
+        for ($a = 1; $a -le $attempts; $a++) {
+
+            # Try direct SendARP query (works on same L2 segment)
+            try {
+                $mac = Get-MacBySendARP -ipAddr $ipAddr
+                if ($mac) { return $mac }
+            } catch {}
+
+            # Nudge ARP: quick ping and a tiny UDP packet to port 9
+            try { Test-Connection -ComputerName $ipAddr -Count 1 -Quiet -TimeoutSeconds 1 | Out-Null } catch {}
+            try {
+                $udp = New-Object System.Net.Sockets.UdpClient
+                $remote = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ipAddr), 9)
+                $udp.Send([byte[]](0), 1, $remote) | Out-Null
+                $udp.Close()
+            } catch {}
+
+            # Read arp -a and look for a MAC on the same line as the IP
+            try {
+                $arpLines = arp -a 2>$null
+                if ($arpLines) {
+                    foreach ($ln in $arpLines) {
+                        if ($ln -match [regex]::Escape($ipAddr)) {
+                            $m = [regex]::Match($ln, '([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}')
+                            if ($m.Success) {
+                                $fmt = Format-MacLocal $m.Value
+                                if ($fmt) { return $fmt }
+                            }
+                        }
+                    }
+                }
+            } catch {}
+
+            if ($a -lt $attempts) { Start-Sleep -Milliseconds 300 }
+        }
+
+        return "N/A"
+    }).AddArgument($ip)
+
+    $handle = $ps.BeginInvoke()
+    if (-not $script:macTasks) { $script:macTasks = @() }
+    $script:macTasks += [pscustomobject]@{ PS = $ps; Handle = $handle; Item = $item; IP = $ip }
+}
+
+function Get-MacVendor {
+    param($mac)
+
+    # Normalize: strip separators, uppercase, take first 6 chars
+    $prefix = ($mac -replace '[:-]', '').Substring(0,6).ToUpper()
+
+    switch ($prefix) {
+        "000C29" { "VMware, Inc." }
+        "001C23" { "Apple, Inc." }
+        "F4F5E8" { "Ubiquiti Networks" }
+        "D8CB8A" { "TP-Link Technologies" }
+        "001A2B" { "Cisco Systems" }
+        "3C5A37" { "Google LLC" }
+        "B827EB" { "Raspberry Pi Foundation" }
+        "FCFBFB" { "Amazon Technologies Inc." }
+        default   { "Unknown Vendor" }
+    }
 }
 
 function Extract-HtmlTitle {
@@ -321,10 +478,12 @@ $button.Add_Click({
 
                 if ($result.Alive) {
                     $item = New-Object System.Windows.Forms.ListViewItem($result.IP)
-                    $item.SubItems.Add("Alive") | Out-Null
-                    $item.SubItems.Add($result.Method) | Out-Null
-                    $item.SubItems.Add("Resolving...") | Out-Null
-                    $item.SubItems.Add("Scanning...") | Out-Null
+                    $item.SubItems.Add("Alive") | Out-Null            # Status (index 1)
+                    $item.SubItems.Add($result.Method) | Out-Null     # Method (index 2)
+                    $item.SubItems.Add("Resolving...") | Out-Null     # Hostname (index 3)
+                    $item.SubItems.Add("Resolving MAC...") | Out-Null # MAC Address placeholder (index 4)
+                    $item.SubItems.Add("Scanning...") | Out-Null      # Web Interface placeholder (index 5)
+
                     $item.ForeColor = 'Green'
                     $listview.Items.Add($item) | Out-Null
 
@@ -333,6 +492,8 @@ $button.Add_Click({
                     # Ensure $script:webTasks is initialized before adding
                     if (-not $script:webTasks) { $script:webTasks = @() }
                     Queue-WebCheck -ip $result.IP -item $item
+
+                    Queue-MacResolve -ip $result.IP -item $item
                 }
                 $j.Job.Dispose()
             }
@@ -354,6 +515,25 @@ $button.Add_Click({
             }
         }
 
+        foreach ($m in @($script:macTasks)) {
+            if ($m.Handle.IsCompleted) {
+                $mac = $null
+                try { $mac = $m.PS.EndInvoke($m.Handle) } catch {}
+                try { $m.PS.Dispose() } catch {}
+
+                # Only set "N/A" if $mac is explicitly $null or empty
+                if ($mac -eq $null -or [string]::IsNullOrWhiteSpace($mac)) {
+                    $mac = "N/A"
+                }
+
+                # Update UI (MAC should be subitem index 4)
+                $m.Item.SubItems[4].Text = $mac
+
+                # Remove task
+                $script:macTasks = $script:macTasks | Where-Object { $_ -ne $m }
+            }
+        }
+
         foreach ($t in @($script:webTasks)) {
             if ($t.Handle.IsCompleted) {
                 try { $probe = $t.PS.EndInvoke($t.Handle) } catch { $probe = $null }
@@ -363,11 +543,12 @@ $button.Add_Click({
                     $display = "{0} ({1})" -f $probe.Proto,$probe.Port
                     if ($probe.Title) { $display += " - $($probe.Title)" }
                     elseif ($probe.Server) { $display += " - $($probe.Server)" }
-                    $t.Item.SubItems[4].Text = $display
+                    # Web interface should be subitem index 5
+                    $t.Item.SubItems[5].Text = $display
                     $t.Item.ForeColor = 'Blue'
                 } else {
                     # Only set "No" if the task finished AND returned nothing
-                    $t.Item.SubItems[4].Text = "No"
+                    $t.Item.SubItems[5].Text = "No"
                 }
 
                 # Remove completed task
@@ -399,7 +580,8 @@ $saveButton.Add_Click({
     $saveDialog.FileName = "AliveHosts.txt"
     if ($saveDialog.ShowDialog() -eq "OK") {
         $listview.Items | ForEach-Object {
-            "$($_.SubItems[0].Text) - $($_.SubItems[1].Text) - $($_.SubItems[2].Text) - $($_.SubItems[3].Text) - $($_.SubItems[4].Text)"
+            # Include Web Interface (subitem 5) in the saved output
+            "$($_.SubItems[0].Text) - $($_.SubItems[1].Text) - $($_.SubItems[2].Text) - $($_.SubItems[3].Text) - $($_.SubItems[4].Text) - $($_.SubItems[5].Text)"
         } | Out-File $saveDialog.FileName -Encoding UTF8
         [System.Windows.Forms.MessageBox]::Show("Saved to $($saveDialog.FileName)")
     }
@@ -408,11 +590,12 @@ $saveButton.Add_Click({
 $listview.Add_DoubleClick({
     if ($listview.SelectedItems.Count -eq 0) { return }
     $item = $listview.SelectedItems[0]
-    $web = $item.SubItems[4].Text
+    # Web interface is in subitem index 5
+    $web = $item.SubItems[5].Text
     $ip = $item.SubItems[0].Text.Trim()
 
     if ($web -and $web -ne "No" -and $web -ne "Scanning...") {
-        # Extract protocol and port (format: PROTO (PORT) - optional title/server)
+        # Extract protocol and port (format: PROTO (PORT) - case-insensitive match)
         if ($web -match "^(http|https)\s*\(\s*(\d+)\s*\)") {
             $proto = $matches[1].ToLower()
             $port = $matches[2].Trim()
@@ -428,5 +611,6 @@ $listview.Add_DoubleClick({
         }
     }
 })
+
 
 [void]$form.ShowDialog()
