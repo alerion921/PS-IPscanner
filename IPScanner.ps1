@@ -41,7 +41,7 @@ $listview = New-Object System.Windows.Forms.ListView
 $listview.Location = New-Object System.Drawing.Point(10,120)
 $listview.Size = New-Object System.Drawing.Size(1065,420)
 $listview.View = 'Details'
-$listview.FullRowSelect = $true
+$listview.FullRowSelect = $false  # Change this to false to allow single cell selection
 $listview.GridLines = $true
 $listview.Columns.Add("IP Address",120) | Out-Null
 $listview.Columns.Add("Status",80) | Out-Null
@@ -51,12 +51,32 @@ $listview.Columns.Add("MAC Address", 220) | Out-Null
 $listview.Columns.Add("Web Interface",280) | Out-Null
 $form.Controls.Add($listview)
 
+# Replace the entire click handler with this improved version
 $listview.Add_Click({
     param($sender, $e)
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
         $hit = $listview.HitTest($e.Location)
-        if ($hit -and $hit.SubItem -ne $null) {
-            [System.Windows.Forms.Clipboard]::SetText($hit.SubItem.Text)
+        if ($hit.Item -and $hit.SubItem) {
+            # Clear any existing selection
+            $listview.SelectedItems.Clear()
+            
+            # Select only the clicked item
+            $hit.Item.Selected = $true
+            
+            $clickedText = $hit.SubItem.Text
+            if (![string]::IsNullOrWhiteSpace($clickedText) -and 
+                $clickedText -ne "N/A" -and 
+                $clickedText -ne "Resolving..." -and 
+                $clickedText -ne "Scanning...") {
+                
+                # Format MAC addresses if that's what was clicked
+                if ($clickedText -match '([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}') {
+                    $formattedText = ($clickedText -replace '-', ':').ToUpper()
+                    [System.Windows.Forms.Clipboard]::SetText($formattedText)
+                } else {
+                    [System.Windows.Forms.Clipboard]::SetText($clickedText)
+                }
+            }
         }
     }
 })
@@ -173,83 +193,79 @@ function Queue-MacResolve {
     $null = $ps.AddScript({
         param($ipAddr)
 
-        function Format-MacLocal {
-            param([string]$hex)
-            $clean = ($hex -replace '[^0-9A-Fa-f]', '').ToUpper()
-            if ($clean.Length -lt 12) { return $null }
-            return ($clean.ToCharArray() |
-                ForEach-Object -Begin { $i = 0 } -Process {
-                    $i++
-                    $_ + (if ($i % 2 -eq 0 -and $i -lt $clean.Length) { ':' } else { '' })
-                }) -join ''
-        }
-
-        # Import SendARP into this runspace (safe if already loaded)
+        # Import SendARP API
         try {
             Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
-public class ArpUtil {
+public class ArpHelper {
     [DllImport("iphlpapi.dll", ExactSpelling=true)]
-    public static extern int SendARP(int destIp, int srcIp, byte[] macAddr, ref int phyAddrLen);
+    public static extern int SendARP(uint destIP, uint srcIP, byte[] macAddr, ref uint macAddrLen);
 }
 "@ -ErrorAction SilentlyContinue
         } catch {}
 
-        function Get-MacBySendARP {
-            param($ip)
-            try {
-                $bytes = [System.Net.IPAddress]::Parse($ipAddr).GetAddressBytes()
-                $ipInt = [System.BitConverter]::ToInt32($bytes,0)
-                $macBuf = New-Object byte[] 6
-                $len = $macBuf.Length
-                $ret = [ArpUtil]::SendARP($ipInt, 0, $macBuf, [ref] $len)
-                if ($ret -eq 0 -and $len -gt 0) {
-                    $actual = $macBuf[0..($len-1)]
-                    $hex = ($actual | ForEach-Object { $_.ToString("X2") }) -join ''
-                    return Format-MacLocal $hex
+        function Convert-IPToInt {
+            param([string]$ipAddress)
+            $bytes = [System.Net.IPAddress]::Parse($ipAddress).GetAddressBytes()
+            [Array]::Reverse($bytes)
+            return [System.BitConverter]::ToUInt32($bytes, 0)
+        }
+
+        function Format-MacAddress {
+            param($macBytes)
+            if ($macBytes -is [byte[]]) {
+                return (($macBytes | ForEach-Object { $_.ToString('X2') }) -join ':')
+            }
+            if ($macBytes -is [string]) {
+                # Clean the string and ensure consistent format
+                $clean = $macBytes -replace '[^0-9A-Fa-f]', ''
+                if ($clean.Length -eq 12) {
+                    return (($clean -split '(..)' | Where-Object { $_ }) -join ':').ToUpper()
                 }
-            } catch {}
+            }
             return $null
         }
 
-        # Simple reliable resolver: try SendARP first, then nudge ARP and parse arp -a, retry a few times.
-        $attempts = 6
-        for ($a = 1; $a -le $attempts; $a++) {
-
-            # Try direct SendARP query (works on same L2 segment)
-            try {
-                $mac = Get-MacBySendARP -ipAddr $ipAddr
-                if ($mac) { return $mac }
-            } catch {}
-
-            # Nudge ARP: quick ping and a tiny UDP packet to port 9
-            try { Test-Connection -ComputerName $ipAddr -Count 1 -Quiet -TimeoutSeconds 1 | Out-Null } catch {}
-            try {
-                $udp = New-Object System.Net.Sockets.UdpClient
-                $remote = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Parse($ipAddr), 9)
-                $udp.Send([byte[]](0), 1, $remote) | Out-Null
-                $udp.Close()
-            } catch {}
-
-            # Read arp -a and look for a MAC on the same line as the IP
-            try {
-                $arpLines = arp -a 2>$null
-                if ($arpLines) {
-                    foreach ($ln in $arpLines) {
-                        if ($ln -match [regex]::Escape($ipAddr)) {
-                            $m = [regex]::Match($ln, '([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}')
-                            if ($m.Success) {
-                                $fmt = Format-MacLocal $m.Value
-                                if ($fmt) { return $fmt }
-                            }
-                        }
-                    }
+        # Try SendARP first
+        try {
+            $destIP = Convert-IPToInt -ipAddress $ipAddr
+            $macAddr = New-Object byte[] 6
+            $macAddrLen = 6
+            $result = [ArpHelper]::SendARP($destIP, 0, $macAddr, [ref]$macAddrLen)
+            if ($result -eq 0) {
+                $mac = Format-MacAddress -macBytes $macAddr[0..5]
+                if ($mac -and $mac -ne '00:00:00:00:00:00') {
+                    return $mac
                 }
-            } catch {}
+            }
+        } catch {}
 
-            if ($a -lt $attempts) { Start-Sleep -Milliseconds 300 }
-        }
+        # Populate ARP cache
+        try {
+            Test-Connection -ComputerName $ipAddr -Count 1 -Quiet | Out-Null
+            Start-Sleep -Milliseconds 100
+        } catch {}
+
+        # Try arp -a
+        try {
+            $arpResult = arp -a $ipAddr 2>$null
+            if ($arpResult) {
+                $match = [regex]::Match($arpResult, '([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}')
+                if ($match.Success) {
+                    return ($match.Value -replace '-', ':').ToUpper()
+                }
+            }
+        } catch {}
+
+        # Try Get-NetNeighbor as last resort
+        try {
+            $neighbor = Get-NetNeighbor -IPAddress $ipAddr -ErrorAction SilentlyContinue | 
+                       Where-Object State -in 'Reachable','Permanent','Stale'
+            if ($neighbor -and $neighbor.LinkLayerAddress) {
+                return $neighbor.LinkLayerAddress.ToUpper()
+            }
+        } catch {}
 
         return "N/A"
     }).AddArgument($ip)
@@ -414,6 +430,25 @@ function Queue-WebCheck {
     $script:webTasks += [pscustomobject]@{ PS = $ps; Handle = $handle; Item = $item; IP = $ip }
 }
 
+function Get-LocalAdapterInfo {
+    param($subnet)
+    $localInfo = @()
+    
+    $adapters = Get-NetAdapter | Where-Object Status -eq 'Up'
+    foreach ($adapter in $adapters) {
+        $ipConfig = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4
+        foreach ($ip in $ipConfig) {
+            if ($ip.IPAddress -match "^$subnet\.") {
+                $localInfo += @{
+                    IP = $ip.IPAddress
+                    MAC = ($adapter.MacAddress -replace '-', ':')
+                    Description = $adapter.InterfaceDescription
+                }
+            }
+        }
+    }
+    return $localInfo
+}
 
 $button.Add_Click({
     $listview.Items.Clear()
@@ -434,9 +469,32 @@ $button.Add_Click({
     $script:rsPool = [runspacefactory]::CreateRunspacePool(2, 18)
     $script:rsPool.Open()
 
+    # Add local adapter detection first
+    $localDevices = Get-LocalAdapterInfo -subnet $subnet
+    foreach ($device in $localDevices) {
+        $item = New-Object System.Windows.Forms.ListViewItem($device.IP)
+        $item.SubItems.Add("Alive") | Out-Null
+        $item.SubItems.Add("Local") | Out-Null
+        $item.SubItems.Add("Resolving...") | Out-Null     # Keep hostname resolution
+        $item.SubItems.Add($device.MAC) | Out-Null        # Set MAC directly
+        $item.SubItems.Add("Local Interface") | Out-Null  # Set interface info
+        $item.ForeColor = 'DarkGreen'
+        $listview.Items.Add($item) | Out-Null
+
+        # Queue hostname resolution but skip MAC and web checks
+        Queue-HostnameResolve -ip $device.IP -item $item
+    }
+
+    # Create a list of IPs to exclude (local devices)
+    $excludeIPs = $localDevices | ForEach-Object { $_.IP }
+
     ForEach ($i in 1..254) {
         if ($script:cancel) { break }
         $ip = "$subnet.$i"
+        
+        # Skip if IP is in exclude list
+        if ($excludeIPs -contains $ip) { continue }
+
         $job = [powershell]::Create().AddScript({
             param($ip)
             $alive = $false
@@ -611,6 +669,5 @@ $listview.Add_DoubleClick({
         }
     }
 })
-
 
 [void]$form.ShowDialog()
