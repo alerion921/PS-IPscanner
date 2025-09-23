@@ -357,37 +357,64 @@ function Queue-HostnameResolve {
         param($ipAddr)
 
         try {
+            # Regex to clean up .local or .home
+            $cleanupSuffix = { param($name) 
+                if ($null -ne $name) { 
+                    return ($name -replace '\.(local|.home)$','') 
+                } 
+                return $name 
+            }
+
+            # --- Prefer DNS / mDNS ---
             try {
                 if (Get-Command -Name Resolve-DnsName -ErrorAction SilentlyContinue) {
                     $r = Resolve-DnsName -Name $ipAddr -ErrorAction SilentlyContinue
                     if ($r) {
                         $nh = ($r | Where-Object { $_.NameHost } | Select-Object -First 1).NameHost
-                        if ($nh) { return $nh }
+                        if ($nh) {
+                            return & $cleanupSuffix $nh
+                        }
                     }
                 }
             } catch {}
 
+            # --- .NET DNS ---
             try {
                 $entry = [System.Net.Dns]::GetHostEntry($ipAddr)
-                if ($entry -and $entry.HostName) { return $entry.HostName }
+                if ($entry -and $entry.HostName) {
+                    $h = & $cleanupSuffix $entry.HostName
+                    # Avoid "localhost" false positives
+                    if ($h -ne 'localhost' -and $h -ne 'localhost.localdomain') {
+                        return $h
+                    }
+                }
             } catch {}
 
+            # --- NetBIOS (nbtstat) ---
             try {
                 $nbtRaw = nbtstat -A $ipAddr 2>$null
                 if ($nbtRaw) {
                     $lines = $nbtRaw -split "`r?`n"
                     foreach ($ln in $lines) {
-                        if ($ln -match '^\s*([^\s]+)\s+<00>\s+UNIQUE') { return $matches[1].Trim() }
+                        if ($ln -match '^\s*([^\s]+)\s+<00>\s+UNIQUE') {
+                            return $matches[1].Trim()
+                        }
                     }
                     foreach ($ln in $lines) {
-                        if ($ln -match '^\s*([^\s]+)\s+<') { return $matches[1].Trim() }
+                        if ($ln -match '^\s*([^\s]+)\s+<') {
+                            return $matches[1].Trim()
+                        }
                     }
                 }
             } catch {}
 
+            # --- MAC / Vendor lookup ---
             try {
                 $mac = $null
-                try { $nb = Get-NetNeighbor -IPAddress $ipAddr -ErrorAction SilentlyContinue; if ($nb) { $mac = $nb.LinkLayerAddress } } catch {}
+                try {
+                    $nb = Get-NetNeighbor -IPAddress $ipAddr -ErrorAction SilentlyContinue
+                    if ($nb) { $mac = $nb.LinkLayerAddress }
+                } catch {}
                 if (-not $mac) {
                     try {
                         $a = arp -a | Select-String $ipAddr
