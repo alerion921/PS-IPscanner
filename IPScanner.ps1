@@ -728,7 +728,7 @@ $button.Add_Click({
     $script:timer.Add_Tick({
         foreach ($j in @($script:jobs)) {
             if ($j.Handle.IsCompleted) {
-                $result = $j.Job.EndInvoke($j.Handle)
+                $result = $j.Job.EndInvoke($j.Handle) | Select-Object -First 1
                 $script:jobs = $script:jobs | Where-Object { $_ -ne $j }
                 $script:completed++
                 if ($script:completed -le $progress.Maximum) { $progress.Value = $script:completed }
@@ -768,7 +768,7 @@ $button.Add_Click({
         foreach ($m in @($script:macTasks)) {
             if ($m.Handle.IsCompleted) {
                 $mac = $null
-                try { $mac = $m.PS.EndInvoke($m.Handle) } catch {}
+                try { $mac = [string]($m.PS.EndInvoke($m.Handle) | Select-Object -First 1) } catch {}
                 try { $m.PS.Dispose() } catch {}
                 if ($null -eq $mac -or [string]::IsNullOrWhiteSpace($mac)) { $mac = "N/A" }
                 $m.Item.SubItems[4].Text = $mac
@@ -778,7 +778,7 @@ $button.Add_Click({
 
         foreach ($t in @($script:webTasks)) {
             if ($t.Handle.IsCompleted) {
-                try { $probe = $t.PS.EndInvoke($t.Handle) } catch { $probe = $null }
+                try { $probe = $t.PS.EndInvoke($t.Handle) | Select-Object -First 1 } catch { $probe = $null }
                 try { $t.PS.Dispose() } catch {}
                 if ($null -ne $probe) {
                     $display = "{0} ({1})" -f $probe.Proto, $probe.Port
