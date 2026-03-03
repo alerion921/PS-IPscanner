@@ -158,7 +158,7 @@ $saveButton.Location = New-Object System.Drawing.Point(420, 42)
 Set-ButtonStyle $saveButton
 $ipGroup.Controls.Add($saveButton)
 
-# Admin Mode checkbox — disabled when not elevated
+# Admin Mode checkbox - disabled when not elevated
 $adminCheck = New-Object System.Windows.Forms.CheckBox
 $adminCheck.Text = "Admin Mode"
 $adminCheck.AutoSize = $true
@@ -351,7 +351,7 @@ function Stop-Scan {
     try { $statusLabel.Text = "Idle" } catch {}
 }
 
-# MAC resolution job — standard path uses only ARP cache + netsh.
+# MAC resolution job - standard path uses only ARP cache + netsh.
 # Admin path also uses SendARP P/Invoke, SMB port seeding, and Get-NetNeighbor.
 function Start-MacResolveJob {
     param(
@@ -449,7 +449,7 @@ public class ArpHelper {
     $script:macTasks += [pscustomobject]@{ PS = $ps; Handle = $handle; Item = $item; IP = $ip }
 }
 
-# Hostname resolution job — no admin-requiring cmdlets in standard path.
+# Hostname resolution job - no admin-requiring cmdlets in standard path.
 function Start-HostnameResolveJob {
     param(
         [string]$ip,
@@ -692,7 +692,7 @@ $button.Add_Click({
                 } catch {}
             }
 
-            # TCP port probe (inlined — Test-Port is defined in outer scope, not available here)
+            # TCP port probe (inlined - Test-Port is defined in outer scope, not available here)
             foreach ($p in $ports) {
                 if ($alive) { break }
                 try {
@@ -728,7 +728,7 @@ $button.Add_Click({
     $script:timer.Add_Tick({
         foreach ($j in @($script:jobs)) {
             if ($j.Handle.IsCompleted) {
-                $result = $j.Job.EndInvoke($j.Handle)
+                $result = $j.Job.EndInvoke($j.Handle) | Select-Object -First 1
                 $script:jobs = $script:jobs | Where-Object { $_ -ne $j }
                 $script:completed++
                 if ($script:completed -le $progress.Maximum) { $progress.Value = $script:completed }
@@ -768,7 +768,7 @@ $button.Add_Click({
         foreach ($m in @($script:macTasks)) {
             if ($m.Handle.IsCompleted) {
                 $mac = $null
-                try { $mac = $m.PS.EndInvoke($m.Handle) } catch {}
+                try { $mac = [string]($m.PS.EndInvoke($m.Handle) | Select-Object -First 1) } catch {}
                 try { $m.PS.Dispose() } catch {}
                 if ($null -eq $mac -or [string]::IsNullOrWhiteSpace($mac)) { $mac = "N/A" }
                 $m.Item.SubItems[4].Text = $mac
@@ -778,7 +778,7 @@ $button.Add_Click({
 
         foreach ($t in @($script:webTasks)) {
             if ($t.Handle.IsCompleted) {
-                try { $probe = $t.PS.EndInvoke($t.Handle) } catch { $probe = $null }
+                try { $probe = $t.PS.EndInvoke($t.Handle) | Select-Object -First 1 } catch { $probe = $null }
                 try { $t.PS.Dispose() } catch {}
                 if ($null -ne $probe) {
                     $display = "{0} ({1})" -f $probe.Proto, $probe.Port
@@ -812,9 +812,9 @@ $button.Add_Click({
 
             $hostsFound = ($listview.Items | Where-Object { $_.SubItems[1].Text -eq "Alive" }).Count
             if ($script:cancel) {
-                $statusLabel.Text = "Scan cancelled — $hostsFound hosts found"
+                $statusLabel.Text = "Scan cancelled - $hostsFound hosts found"
             } else {
-                $statusLabel.Text = "Scan complete — $hostsFound hosts found"
+                $statusLabel.Text = "Scan complete - $hostsFound hosts found"
             }
         }
     })
